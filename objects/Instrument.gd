@@ -15,6 +15,17 @@ enum InstrumentType {
 	MAX
 }
 
+enum SwingType {
+	SWING_GLOBAL,
+	SWING_CLASSIC,
+	SWING_MPC,
+	SWING_TR_909,
+	SWING_SP_1200,
+	MAX
+}
+
+const MAX_SWING_AMOUNT := 100
+
 const MAX_VOLUME := 256
 const MAX_FILTER_CUTOFF := 128
 const MAX_FILTER_RESONANCE := 9
@@ -57,6 +68,12 @@ var color_palette: int:
 ## Low pass filter resonance.
 @export var lp_resonance: int = 0:
 	set(value): lp_resonance = ValueValidator.range(value, 0, MAX_FILTER_RESONANCE)
+## Swing profile. Global inherits the song's original swing setting.
+@export var swing_type: int = SwingType.SWING_GLOBAL:
+	set(value): swing_type = ValueValidator.index(value, SwingType.MAX)
+## Individual swing intensity, in percent.
+@export var swing_amount: int = 0:
+	set(value): swing_amount = ValueValidator.range(value, 0, MAX_SWING_AMOUNT)
 
 
 func _init(voice_data: VoiceManager.VoiceData) -> void:

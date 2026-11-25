@@ -22,8 +22,8 @@ const NOTE_LENGTH := 4.0 # In 1/16ths of a beat.
 const NOTE_SWING_THRESHOLD := 0.2 # In portion of NOTE_LENGTH (i.e. = 20%).
 const NOTE_GRACE_PERIOD := 4
 
-const NOTE_SWING_MIN := NOTE_SWING_THRESHOLD * NOTE_LENGTH
-const NOTE_SWING_MAX := (2 - NOTE_SWING_THRESHOLD) * NOTE_LENGTH
+# GDSiON 0.7 uses 480 ticks per beat (120 per sixteenth note).
+const SWING_TICKS_PER_NOTE := 120
 
 var _driver: SiONDriver = null
 var _effects: Array[SiEffectBase] = []
@@ -31,7 +31,6 @@ var _active_effect: SiEffectBase = null
 
 var _music_playing: bool = false
 var _music_exporting: bool = false
-var _swing_active: bool = false
 var _playing_residue: bool = false
 var _exporting_callback: Callable = Callable()
 
@@ -41,6 +40,12 @@ var _pattern_time: int = -1
 ## Note residue tracker to make sure we don't cut off the sound during export.
 var _note_residue: PackedInt32Array = PackedInt32Array()
 var _note_residue_time: int = 0
+
+## Signed onset offsets for the upcoming odd step, keyed by instrument.
+var _swing_offsets: Dictionary = {}
+var _swing_offset: int = 0
+## Delayed notes from the current logical step, in arrangement channel order.
+var _swing_patterns: Array[QueuedSwingPattern] = []
 
 
 # Initialization.
@@ -82,6 +87,9 @@ func reset_driver() -> void:
 	# to supply the stream with new notes to play based on the composition of the current song.
 	
 	_driver.stop()
+	_reset_swing()
+	if _music_playing && Controller.current_song && _pattern_time % 2 == 1 && _pattern_time < Controller.current_song.pattern_size:
+		_swing_offset = _prepare_swing_offsets(Controller.current_song)
 
 	update_driver_bpm()
 	_driver.stream()
@@ -228,10 +236,14 @@ func _playback_step() -> void:
 	if not song || song.instruments.is_empty() || song.patterns.is_empty() || not song.arrangement:
 		return
 	
+	# Intermediate callbacks only play the notes queued for this step.
+	if not _swing_patterns.is_empty():
+		_play_swing_patterns(song)
+		return
+
 	# Prepare the next timeline bar in the arrangement.
 	if _pattern_time >= song.pattern_size:
 		_pattern_time = 0
-		_update_swing()
 		
 		var timeline_looped := song.arrangement.progress_loop()
 		if _music_exporting && timeline_looped:
@@ -253,14 +265,36 @@ func _playback_step() -> void:
 			pattern.is_playing = true
 			
 			var active_instrument := song.instruments[pattern.instrument_idx]
+			var offset := _swing_offset
+			if _pattern_time % 2 == 1:
+				offset = int(_swing_offsets.get(active_instrument, _swing_offset))
+			
+			var queued: QueuedSwingPattern = null
 			for note_idx in pattern.note_amount:
-				_play_note(pattern, active_instrument, pattern.notes[note_idx], _pattern_time)
+				var note_data := pattern.notes[note_idx]
+				if note_data.y != _pattern_time:
+					continue
+				
+				if offset <= _swing_offset:
+					_play_note(pattern, active_instrument, note_data, _pattern_time)
+				else:
+					if not queued:
+						queued = QueuedSwingPattern.new()
+						queued.offset = offset
+						queued.pattern = pattern
+						queued.instrument = active_instrument
+					queued.notes.push_back(note_data)
+			
+			if queued:
+				_swing_patterns.push_back(queued)
+
 	
-	# Finalize the step
+	# Finalize the logical step only once, not for intermediate swing callbacks.
 	_pattern_time += 1
 	_update_residue()
-	_update_swing()
-	playback_tick.emit()
+	if _music_playing:
+		_schedule_swing_step(song)
+		playback_tick.emit()
 
 
 func _update_residue() -> void:
@@ -283,24 +317,88 @@ func _update_residue() -> void:
 		_stop_exporting()
 
 
-func _update_swing() -> void:
-	if not _driver:
+## Odd-step offset in GDSiON ticks. Even steps always stay on the grid.
+static func get_swing_offset(swing_type: int, swing_amount: int, global_swing: int) -> int:
+	match swing_type:
+		Instrument.SwingType.SWING_GLOBAL:
+			# Preserve the original playback direction and 20%-180% interval range.
+			return roundi(-global_swing * SWING_TICKS_PER_NOTE * (1.0 - NOTE_SWING_THRESHOLD) / 10.0)
+		Instrument.SwingType.SWING_CLASSIC:
+			# Straight (50%) through 3:1 swing (75%).
+			return roundi(swing_amount * SWING_TICKS_PER_NOTE / 200.0)
+		Instrument.SwingType.SWING_MPC:
+			# Quantize downward on a 96 PPQN grid, up to 12 ticks.
+			return floori(swing_amount * 12.0 / 100.0) * 5
+		Instrument.SwingType.SWING_TR_909:
+			# Seven stages, from 0 to 12 ticks at 96 PPQN.
+			return roundi(swing_amount * 6.0 / 100.0) * 10
+		Instrument.SwingType.SWING_SP_1200:
+			# Six stages, from 0 to 10 ticks at 96 PPQN.
+			return roundi(swing_amount * 5.0 / 100.0) * 10
+	return 0
+
+
+func _prepare_swing_offsets(song: Song) -> int:
+	_swing_offsets.clear()
+	var first_offset := SWING_TICKS_PER_NOTE
+	for instrument in song.instruments:
+		var offset := get_swing_offset(instrument.swing_type, instrument.swing_amount, song.swing)
+		_swing_offsets[instrument] = offset
+		first_offset = mini(first_offset, offset)
+	
+	return first_offset if not _swing_offsets.is_empty() else 0
+
+
+func _set_swing_interval(ticks: int) -> void:
+	# The driver truncates its converted event length to an integer. Half a tick
+	# protects exact integer intervals against floating-point rounding.
+	_driver.set_timer_interval((ticks + 0.5) * NOTE_LENGTH / SWING_TICKS_PER_NOTE)
+
+
+func _schedule_swing_step(song: Song) -> void:
+	if not _swing_patterns.is_empty():
+		var next_offset := SWING_TICKS_PER_NOTE
+		for queued in _swing_patterns:
+			next_offset = mini(next_offset, queued.offset)
+		
+		_set_swing_interval(next_offset - _swing_offset)
+		_swing_offset = next_offset
 		return
-
-	if Controller.current_song.swing == 0:
-		if _swing_active:
-			_driver.set_timer_interval(NOTE_LENGTH)
-			_swing_active = false
-		return
-
-	_swing_active = true
-
-	# Remapping swing setting range from -10 to 10, to 20% - 180% of NOTE_LENGTH.
-	var fswing: float = NOTE_SWING_MIN + (Controller.current_song.swing + 10.0) * (NOTE_SWING_MAX - NOTE_SWING_MIN) / 20.0
-	if _pattern_time % 2 == 0:
-		_driver.set_timer_interval(fswing)
+	
+	# An early global swing needs the next odd step to begin before the grid.
+	# Snapshot offsets for that step so edits cannot move already queued events.
+	var next_offset := 0
+	if _pattern_time < song.pattern_size && _pattern_time % 2 == 1:
+		next_offset = _prepare_swing_offsets(song)
 	else:
-		_driver.set_timer_interval(2 * NOTE_LENGTH - fswing)
+		_swing_offsets.clear()
+	
+	# All intermediate intervals plus this remainder cover exactly one step.
+	_set_swing_interval(SWING_TICKS_PER_NOTE + next_offset - _swing_offset)
+	_swing_offset = next_offset
+
+
+func _play_swing_patterns(song: Song) -> void:
+	var i := 0
+	while i < _swing_patterns.size():
+		var queued := _swing_patterns[i]
+		if queued.offset != _swing_offset:
+			i += 1
+			continue
+		
+		for note_data in queued.notes:
+			_play_note(queued.pattern, queued.instrument, note_data, note_data.y)
+		_swing_patterns.remove_at(i)
+	
+	_schedule_swing_step(song)
+
+
+func _reset_swing() -> void:
+	_swing_patterns.clear()
+	_swing_offsets.clear()
+	_swing_offset = 0
+	if _driver:
+		_driver.set_timer_interval(NOTE_LENGTH)
 
 
 func is_playing() -> bool:
@@ -344,6 +442,11 @@ func start_playback() -> void:
 	
 	if _pattern_time == -1:
 		_pattern_time = 0
+	
+	_reset_swing()
+	var song := Controller.current_song
+	if song && _pattern_time < song.pattern_size && _pattern_time % 2 == 1:
+		_swing_offset = _prepare_swing_offsets(song)
 	_music_playing = true
 	
 	_driver.timer_interval.connect(_playback_step)
@@ -357,6 +460,7 @@ func pause_playback(pause_driver: bool = false) -> void:
 		_cutoff_note()
 		_driver.timer_interval.disconnect(_playback_step)
 	
+	_reset_swing()
 	if pause_driver:
 		_driver.pause() # Make sure driver doesn't try to process anything.
 	
@@ -369,6 +473,7 @@ func stop_playback() -> void:
 		_cutoff_note()
 		_driver.timer_interval.disconnect(_playback_step)
 	
+	_reset_swing()
 	if Controller.current_song:
 		Controller.current_song.reset_arrangement()
 	
@@ -455,6 +560,13 @@ func render_samples(samples: Array[QueuedSample]) -> void:
 	
 	_music_exporting = false
 	reset_driver() # Restarts the driver, because rendering stops it.
+
+
+class QueuedSwingPattern:
+	var offset: int = 0
+	var pattern: Pattern = null
+	var instrument: Instrument = null
+	var notes: Array[Vector3i] = []
 
 
 class QueuedSample:
